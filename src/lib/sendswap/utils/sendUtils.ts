@@ -11,7 +11,7 @@ import { executeTx, getSendOpGenerator, getSendOpType } from '$lib/magiTransacti
 import { getHiveDepositOp } from '$lib/magiTransactions/hive/vscOperations/deposit'
 import { getKeepsatsDestinationDid, getKeepsatsTransferOp } from '$lib/magiTransactions/hive/vscOperations/keepsatsTransfer'
 import { getBtcApproveOp, getTokenApproveOp, getHiveSwapOp } from '$lib/magiTransactions/hive/vscOperations/swap'
-import { fetchCustomTokens } from '$lib/tokens/customTokens'
+import { fetchCustomTokens, customTokenCoin, type CustomToken } from '$lib/tokens/customTokens'
 import { assertBtcRecipientAllowed } from './btcAddressGuard'
 import {
 	accountBalance,
@@ -571,6 +571,33 @@ export function solveToNetworks(state: TxStateBase): Network[] {
 	}
 }
 
+/**
+ * Resolve the from/to catalog entries for a send, custom tokens included.
+ *
+ * The static swap catalog holds HIVE/HBD/sHBD/BTC only. `send()` used to read
+ * it with non-null assertions — `getToOption(v)!` — so a custom token silently
+ * became `undefined`, the compiler was told otherwise, and the first
+ * `toCoin.coin` downstream threw "can't access property 'coin'". Custom tokens
+ * exist on Magi only, hence the single-network list.
+ *
+ * Exported so the resolution can be tested without standing up a broadcast.
+ */
+export function resolveSendAssets(
+	fromValue: string,
+	toValue: string,
+	customTokens: CustomToken[]
+): { from?: AssetOption; to?: AssetOption } {
+	const custom: AssetOption[] = customTokens.map((t) => ({
+		coin: customTokenCoin(t),
+		networks: [Network.magi]
+	}));
+	const findCustom = (v: string) => custom.find((o) => o.coin.value === v);
+	return {
+		from: getFromOption(fromValue) ?? findCustom(fromValue),
+		to: getToOption(toValue) ?? findCustom(toValue)
+	};
+}
+
 export async function send(
 	details: TxState,
 	auth: Auth,
@@ -579,12 +606,37 @@ export async function send(
 	signal?: AbortSignal | undefined
 ): Promise<Error | { id: string }> {
 	// console.log('start of send() function, details:', details);
+	// Custom tokens are discovered, not listed in the static catalog, so fetch
+	// them at most once per send and only when something actually needs them.
+	let customTokensCache: CustomToken[] | null = null;
+	const getCustomTokens = async () => (customTokensCache ??= await fetchCustomTokens());
+
 	// `fromCoin`/`toCoin` are AssetOption (catalog entries with networks list)
 	// — needed downstream for `.networks` lookups. The coin and network
 	// themselves come from `details.from`/`details.to`.
-	const fromCoin = getFromOption(details.from!.coin.value)!;
+	//
+	// These used to be `getFromOption(...)!` / `getToOption(...)!`. Those read
+	// the STATIC swap catalog, which holds only HIVE/HBD/sHBD/BTC — so a custom
+	// token resolved to undefined, the non-null assertion hid it from the
+	// compiler, and the first `toCoin.coin` downstream threw
+	// "can't access property 'coin'". A custom token exists on Magi only.
+	let fromCoin = getFromOption(details.from!.coin.value);
+	let toCoin = getToOption(details.to!.coin.value);
+	if (!fromCoin || !toCoin) {
+		// Only pay for token discovery when the static catalog actually misses.
+		({ from: fromCoin, to: toCoin } = resolveSendAssets(
+			details.from!.coin.value,
+			details.to!.coin.value,
+			await getCustomTokens()
+		));
+	}
+	if (!fromCoin || !toCoin) {
+		const missing = !fromCoin ? details.from!.coin : details.to!.coin;
+		const msg = `${missing.label} can't be used here — it isn't a swappable asset on this network.`;
+		setStatus(msg, true);
+		return new Error(msg);
+	}
 	const fromNetwork = details.from!.network;
-	const toCoin = getToOption(details.to!.coin.value)!;
 	const toNetwork = details.to!.network;
 	const toUsername = details.toUsername;
 	// Resolve send amount — toAmount may lag on deposit/withdraw due to effect timing,
@@ -683,7 +735,7 @@ export async function send(
 		// Custom tokens are swappable wherever they have a pool, so the set is
 		// resolved at broadcast time rather than hardcoded. Discovery is cached
 		// and falls back to [] on failure, which just leaves the native three.
-		const customTokens = await fetchCustomTokens();
+		const customTokens = await getCustomTokens();
 		const customToken = customTokens.find((t) => t.symbol === fromCoin.coin.value);
 		const swapCoins = [
 			Coin.hive.value,
